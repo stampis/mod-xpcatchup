@@ -31,6 +31,7 @@ struct PendingXP
     uint32 total = 0;          // Total XP to redistribute
     uint8  count = 0;          // How many group members contributed
     time_t timestamp = 0;      // When the first XP was captured (for cleanup)
+    std::vector<ObjectGuid> contributors;  // Track which members have contributed
 };
 
 // Target share for dynamic XP distribution
@@ -51,7 +52,6 @@ extern bool   _logging;
 
 // Global state
 extern std::unordered_map<ObjectGuid, PendingXP> _pendingXP;
-extern std::unordered_map<ObjectGuid, time_t>    _cooldown;
 
 } // namespace XPCatchup
 

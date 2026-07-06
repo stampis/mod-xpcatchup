@@ -43,42 +43,79 @@ namespace XPCatchup
 
 using namespace XPCatchup;
 
-// Helper: Find the master (party leader, must be a real player)
-static Player* FindMaster(Group* group)
+// Helper: Check if a player is within the level window of the reference player
+static bool IsWithinLevelWindow(Player* member, Player* reference)
 {
-    ObjectGuid leaderGUID = group->GetLeaderGUID();
-    if (leaderGUID.IsEmpty())
-        return nullptr;
-
-    Player* leader = ObjectAccessor::FindPlayer(leaderGUID);
-    if (!leader)
-        return nullptr;
-
-    if (!leader->GetSession())
-        return nullptr;
-
-    // Only require the master to be a real player if config says so
-    // Requires mod-playerbots (IsBot() only exists when MOD_PLAYERBOTS is defined)
-#ifdef MOD_PLAYERBOTS
-    if (_requireRealMaster && leader->GetSession()->IsBot())
-        return nullptr;
-#endif
-
-    return leader;
-}
-
-// Helper: Check if a player is within the level window of the master
-static bool IsWithinLevelWindow(Player* member, Player* master)
-{
-    int8 levelDiff = std::abs(master->GetLevel() - member->GetLevel());
+    int8 levelDiff = std::abs(reference->GetLevel() - member->GetLevel());
     return levelDiff <= static_cast<int8>(_levelWindow);
 }
 
-// Helper: Find the single lowest-XP eligible member
-static Player* FindLowestXPMember(Group* group, ObjectGuid excludeGUID)
+static bool IsExpectedContributor(Player* member, Unit* victim, Player* currentPlayer)
 {
-    Player* master = FindMaster(group);
-    if (!master)
+    if (!member || !victim)
+        return false;
+
+    return member == currentPlayer || member->IsAtGroupRewardDistance(victim);
+}
+
+static float GetProgressRatio(Player* player)
+{
+    uint32 nextLevelXP = player->GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
+    return (nextLevelXP > 0) ? (float)player->GetUInt32Value(PLAYER_XP) / nextLevelXP : 0.0f;
+}
+
+// Reference player = highest-level player eligible for XP on this kill.
+// Ties on level are broken by progress ratio toward the next level.
+static Player* FindReferencePlayer(Group* group, Unit* victim, Player* currentPlayer)
+{
+    if (!group || !victim)
+        return nullptr;
+
+    Player* reference = nullptr;
+    uint8 highestLevel = 0;
+    float highestRatio = -1.0f;
+
+    group->DoForAllMembers([&](Player* member)
+    {
+        if (!IsExpectedContributor(member, victim, currentPlayer))
+            return;
+
+        uint8 memberLevel = member->GetLevel();
+        float memberRatio = GetProgressRatio(member);
+
+        if (!reference || memberLevel > highestLevel || (memberLevel == highestLevel && memberRatio > highestRatio))
+        {
+            reference = member;
+            highestLevel = memberLevel;
+            highestRatio = memberRatio;
+        }
+    });
+
+    return reference;
+}
+
+// Count the players that AzerothCore will actually process for kill XP on this victim.
+// This must match KillRewarder group iteration more closely than GetMembersCount(),
+// otherwise the pool can wait forever on offline/out-of-range members.
+static uint32 GetExpectedContributorCount(Group* group, Unit* victim, Player* currentPlayer)
+{
+    if (!group || !victim)
+        return 0;
+
+    uint32 count = 0;
+    group->DoForAllMembers([&](Player* member)
+    {
+        if (IsExpectedContributor(member, victim, currentPlayer))
+            ++count;
+    });
+
+    return count;
+}
+
+// Helper: Find the single lowest-XP eligible member
+static Player* FindLowestXPMember(Group* group, Player* reference, Unit* victim, Player* currentPlayer, ObjectGuid excludeGUID)
+{
+    if (!reference)
         return nullptr;
 
     Player* lowest = nullptr;
@@ -86,20 +123,14 @@ static Player* FindLowestXPMember(Group* group, ObjectGuid excludeGUID)
 
     group->DoForAllMembers([&](Player* member)
     {
-        if (!member)
+        if (!IsExpectedContributor(member, victim, currentPlayer))
             return;
         if (member->GetGUID() == excludeGUID)
             return;
-        if (member == master)
-            return;
-        if (!IsWithinLevelWindow(member, master))
-            return;
-        if (member->GetLevel() > master->GetLevel())
+        if (!IsWithinLevelWindow(member, reference))
             return;
 
-        uint32 currentXP = member->GetUInt32Value(PLAYER_XP);
-        uint32 nextLevelXP = member->GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
-        float ratio = (nextLevelXP > 0) ? (float)currentXP / nextLevelXP : 0.0f;
+        float ratio = GetProgressRatio(member);
 
         if (ratio < lowestRatio)
         {
@@ -111,118 +142,177 @@ static Player* FindLowestXPMember(Group* group, ObjectGuid excludeGUID)
     return lowest;
 }
 
-// Helper: Find the master's XP deficit weight (negative when master is ahead)
-static int32 GetDeficit(Player* member, Player* master)
+// Helper: Find the reference player's XP deficit weight
+static int32 GetDeficit(Player* member, Player* reference)
 {
-    uint32 masterXP = master->GetUInt32Value(PLAYER_XP);
-    uint32 masterNextLevelXP = master->GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
-    float masterRatio = (masterNextLevelXP > 0) ? (float)masterXP / masterNextLevelXP : 0.0f;
-    uint32 masterLevel = master->GetLevel();
+    float referenceRatio = GetProgressRatio(reference);
+    uint32 referenceLevel = reference->GetLevel();
 
-    uint32 memberXP = member->GetUInt32Value(PLAYER_XP);
-    uint32 memberNextLevelXP = member->GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
-    float memberRatio = (memberNextLevelXP > 0) ? (float)memberXP / memberNextLevelXP : 0.0f;
-    uint32 levelDeficit = masterLevel - member->GetLevel();
+    float memberRatio = GetProgressRatio(member);
+    uint32 levelDeficit = referenceLevel - member->GetLevel();
     return static_cast<int32>(levelDeficit * 10000.0f)
-         + static_cast<int32>((masterRatio - memberRatio) * 10000.0f);
+         + static_cast<int32>((referenceRatio - memberRatio) * 10000.0f);
 }
 
 // Helper: Find dynamic targets with weighted XP distribution
-static std::vector<TargetShare> FindDynamicTargets(Group* group, Player* master)
+static std::vector<TargetShare> FindDynamicTargets(Group* group, Player* reference, Unit* victim, Player* currentPlayer)
 {
     std::vector<TargetShare> targets;
     uint32 totalWeight = 0;
+    float referenceRatio = GetProgressRatio(reference);
+    uint32 nonContributors = 0;
+    uint32 outsideWindow = 0;
+    std::vector<std::string> sampleIncluded;
+    std::vector<std::string> sampleOutsideWindow;
 
     group->DoForAllMembers([&](Player* member)
     {
-        if (!member)
+        if (!IsExpectedContributor(member, victim, currentPlayer))
+        {
+            ++nonContributors;
             return;
-        if (member == master)
-            return;
-        if (!IsWithinLevelWindow(member, master))
-            return;
-        if (member->GetLevel() > master->GetLevel())
-            return;
+        }
 
-        int32 deficit = GetDeficit(member, master);
+        float memberRatio = GetProgressRatio(member);
+        int32 deficit = GetDeficit(member, reference);
+        int32 levelDiff = static_cast<int32>(reference->GetLevel()) - static_cast<int32>(member->GetLevel());
+
+        if (!IsWithinLevelWindow(member, reference))
+        {
+            ++outsideWindow;
+            if (sampleOutsideWindow.size() < 5)
+            {
+                std::ostringstream oss;
+                oss << member->GetName() << "(lvl " << static_cast<uint32>(member->GetLevel()) << ", diff " << levelDiff << ")";
+                sampleOutsideWindow.push_back(oss.str());
+            }
+            return;
+        }
+
         uint32 weight = deficit > 0 ? static_cast<uint32>(deficit) : 1;
         totalWeight += weight;
         targets.push_back({member, weight});
-    });
 
-    // Edge case: If no eligible targets found, force equal split among all non-master members
-    if (targets.empty())
-    {
-        group->DoForAllMembers([&](Player* member)
+        if (sampleIncluded.size() < 5)
         {
-            if (!member || member == master)
-                return;
-            targets.push_back({member, 1});
-        });
-    }
-
-    // Include master in distribution when they have the lowest XP progress ratio
-    // (i.e., bots have caught up to or passed the master)
-    float masterRatio = (master->GetUInt32Value(PLAYER_NEXT_LEVEL_XP) > 0)
-        ? (float)master->GetUInt32Value(PLAYER_XP) / master->GetUInt32Value(PLAYER_NEXT_LEVEL_XP)
-        : 0.0f;
-
-    bool masterIsLowest = true;
-    group->DoForAllMembers([&](Player* member)
-    {
-        if (!member || member == master)
-            return;
-
-        float memberRatio = (member->GetUInt32Value(PLAYER_NEXT_LEVEL_XP) > 0)
-            ? (float)member->GetUInt32Value(PLAYER_XP) / member->GetUInt32Value(PLAYER_NEXT_LEVEL_XP)
-            : 0.0f;
-
-        if (memberRatio < masterRatio)
-        {
-            masterIsLowest = false;
+            std::ostringstream oss;
+            oss << member->GetName() << "(lvl " << static_cast<uint32>(member->GetLevel()) << ", w " << weight << ", d " << deficit << ")";
+            sampleIncluded.push_back(oss.str());
         }
     });
 
-    if (masterIsLowest && !targets.empty())
+    if (_logging)
     {
-        uint32 masterWeight = 1;
-        totalWeight += masterWeight;
-        targets.push_back({master, masterWeight});
+        std::ostringstream oss;
+        oss << "[XP Catch-Up] Dynamic: ref=" << reference->GetName()
+            << " lvl=" << static_cast<uint32>(reference->GetLevel())
+            << " ratio=" << std::fixed << std::setprecision(4) << referenceRatio
+            << " targets=" << targets.size()
+            << " weight=" << totalWeight
+            << " outWin=" << outsideWindow
+            << " nonXP=" << nonContributors;
+
+        if (!sampleIncluded.empty())
+        {
+            oss << "\n  in: ";
+            for (size_t i = 0; i < sampleIncluded.size(); ++i)
+            {
+                if (i)
+                    oss << ", ";
+                oss << sampleIncluded[i];
+            }
+            if (targets.size() > sampleIncluded.size())
+                oss << ", ...";
+        }
+
+        if (!sampleOutsideWindow.empty())
+        {
+            oss << "\n  out: ";
+            for (size_t i = 0; i < sampleOutsideWindow.size(); ++i)
+            {
+                if (i)
+                    oss << ", ";
+                oss << sampleOutsideWindow[i];
+            }
+            if (outsideWindow > sampleOutsideWindow.size())
+                oss << ", ...";
+        }
+
+        LOG_INFO("XPCatchup", "{}", oss.str());
     }
 
     return targets;
 }
 
-// Check if any group member has >= threshold XP deficit relative to the master.
+// Check if any group member has >= threshold XP deficit relative to the reference player.
 // Returns false when the group is close enough that catchup is unnecessary.
-static bool HasCatchupNeed(Group* group, Player* master)
+static bool HasCatchupNeed(Group* group, Player* reference, Unit* victim, Player* currentPlayer, bool shouldLog)
 {
-    float masterRatio = (master->GetUInt32Value(PLAYER_NEXT_LEVEL_XP) > 0)
-        ? (float)master->GetUInt32Value(PLAYER_XP) / master->GetUInt32Value(PLAYER_NEXT_LEVEL_XP)
-        : 0.0f;
-
+    float referenceRatio = GetProgressRatio(reference);
     bool found = false;
+    uint32 eligibleMembers = 0;
+    uint32 membersBehindThreshold = 0;
+    float maxDeficitPct = 0.0f;
+    std::vector<std::string> behindSample;
+
     group->DoForAllMembers([&](Player* member)
     {
-        if (!member || member == master)
+        if (!IsExpectedContributor(member, victim, currentPlayer))
+            return;
+        if (!IsWithinLevelWindow(member, reference))
             return;
 
-        float memberRatio = (member->GetUInt32Value(PLAYER_NEXT_LEVEL_XP) > 0)
-            ? (float)member->GetUInt32Value(PLAYER_XP) / member->GetUInt32Value(PLAYER_NEXT_LEVEL_XP)
-            : 0.0f;
+        ++eligibleMembers;
+        float memberRatio = GetProgressRatio(member);
+        float deficitPct = (referenceRatio - memberRatio) * 100.0f;
+        maxDeficitPct = std::max(maxDeficitPct, deficitPct);
 
-        // Threshold deficit: member ratio is at least threshold percentage points behind master
-        if ((masterRatio - memberRatio) >= _threshold * 0.01f)
+        if ((referenceRatio - memberRatio) >= _threshold * 0.01f)
         {
             found = true;
+            ++membersBehindThreshold;
+
+            if (behindSample.size() < 5)
+            {
+                std::ostringstream oss;
+                oss << member->GetName() << "(" << std::fixed << std::setprecision(2) << deficitPct << "%)";
+                behindSample.push_back(oss.str());
+            }
         }
     });
+
+    if (_logging && shouldLog)
+    {
+        std::ostringstream oss;
+        oss << "[XP Catch-Up] Check: ref=" << reference->GetName()
+            << " lvl=" << static_cast<uint32>(reference->GetLevel())
+            << " th=" << _threshold << "%"
+            << " elig=" << eligibleMembers
+            << " behind=" << membersBehindThreshold
+            << " max=" << std::fixed << std::setprecision(2) << maxDeficitPct << "%"
+            << " result=" << (found ? "need" : "skip");
+
+        if (!behindSample.empty())
+        {
+            oss << "\n  behind: ";
+            for (size_t i = 0; i < behindSample.size(); ++i)
+            {
+                if (i)
+                    oss << ", ";
+                oss << behindSample[i];
+            }
+            if (membersBehindThreshold > behindSample.size())
+                oss << ", ...";
+        }
+
+        LOG_INFO("XPCatchup", "{}", oss.str());
+    }
 
     return found;
 }
 
 // Helper: Distribute XP pool among targets proportionally by weight
-static void DistributeXP(uint32 pool, std::vector<TargetShare>& targets, Player* victim, Player* master, Group* group)
+static void DistributeXP(uint32 pool, std::vector<TargetShare>& targets, Unit* victim, Player* reference, Group* group)
 {
     if (targets.empty())
         return;
@@ -236,19 +326,15 @@ static void DistributeXP(uint32 pool, std::vector<TargetShare>& targets, Player*
     std::vector<int32> deficits;
 
     // Save XP deficits before giving XP (state before this kill)
-    uint32 masterXP = master->GetUInt32Value(PLAYER_XP);
-    uint32 masterNextLevelXP = master->GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
-    float masterRatio = (masterNextLevelXP > 0) ? (float)masterXP / masterNextLevelXP : 0.0f;
-    uint32 masterLevel = master->GetLevel();
+    float referenceRatio = GetProgressRatio(reference);
+    uint32 referenceLevel = reference->GetLevel();
 
     for (auto& t : targets)
     {
-        uint32 memberXP = t.player->GetUInt32Value(PLAYER_XP);
-        uint32 memberNextLevelXP = t.player->GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
-        float memberRatio = (memberNextLevelXP > 0) ? (float)memberXP / memberNextLevelXP : 0.0f;
-        uint32 levelDeficit = masterLevel - t.player->GetLevel();
+        float memberRatio = GetProgressRatio(t.player);
+        uint32 levelDeficit = referenceLevel - t.player->GetLevel();
         int32 totalDeficit = static_cast<int32>(levelDeficit * 10000.0f)
-                           + static_cast<int32>((masterRatio - memberRatio) * 10000.0f);
+                           + static_cast<int32>((referenceRatio - memberRatio) * 10000.0f);
         deficits.push_back(totalDeficit);
     }
 
@@ -305,14 +391,35 @@ static void DistributeXP(uint32 pool, std::vector<TargetShare>& targets, Player*
         // log distribution summary to console (if _logging)
         if (_logging)
         {
-        std::ostringstream oss;
-        oss << "[XP Catch-Up] Distribution: total=" << pool
-            << " targets=" << targets.size();
-        for (auto& t : targets)
-        {
-            oss << " " << t.player->GetName() << "=" << (pool * t.weight) / totalWeight;
-        }
-            LOG_INFO("XPCatchup", "%s", oss.str().c_str());
+            std::ostringstream oss;
+            oss << "[XP Catch-Up] Distribution: total=" << pool
+                << " targets=" << targets.size();
+
+            size_t perLine = 0;
+            for (auto& t : targets)
+            {
+                std::ostringstream entry;
+                entry << t.player->GetName() << "=" << (pool * t.weight) / totalWeight;
+                std::string part = entry.str();
+
+                if (perLine == 0)
+                {
+                    oss << "\n  out: " << part;
+                    perLine = 1;
+                }
+                else if (perLine >= 6)
+                {
+                    oss << "\n  out: " << part;
+                    perLine = 1;
+                }
+                else
+                {
+                    oss << ", " << part;
+                    ++perLine;
+                }
+            }
+
+            LOG_INFO("XPCatchup", "{}", oss.str());
         }
     }
 }
@@ -333,14 +440,20 @@ void XPCatchupPlayerScript::OnPlayerGiveXP(Player* player, uint32& amount, Unit*
     if (!_enabled)
         return;
 
-    // Skip catchup when no member has >= 10% deficit (group is close enough)
-    // This lets natural XP flow when everyone is within 10% of each other
-    Player* master = FindMaster(group);
-    if (master && !HasCatchupNeed(group, master))
+    // Use the highest-level eligible player for this kill as the reference point.
+    // Catchup pauses once everyone eligible is within the configured threshold of that player.
+    Player* reference = FindReferencePlayer(group, victim, player);
+    if (!reference)
+        return;
+
+    bool shouldLogThisKill = _logging && player == reference;
+
+    if (!HasCatchupNeed(group, reference, victim, player, shouldLogThisKill))
     {
-        if (_logging)
+        if (shouldLogThisKill)
         {
-            LOG_INFO("XPCatchup", "[XP Catch-Up] No catchup need: group within 10% deficit. Skipping victim {}", victim->GetEntry());
+            LOG_INFO("XPCatchup", "[XP Catch-Up] Skip: ref={} lvl={} mob={} all within {}%",
+                reference->GetName(), reference->GetLevel(), victim->GetEntry(), _threshold);
         }
         return;
     }
@@ -352,39 +465,65 @@ void XPCatchupPlayerScript::OnPlayerGiveXP(Player* player, uint32& amount, Unit*
     if (isFirst)
     {
         // First player: their XP goes into the pool
-        _pendingXP[victim->GetGUID()] = { amount, 1, time(NULL) };
+        _pendingXP[victim->GetGUID()] = { amount, 1, time(NULL), { player->GetGUID() } };
+
+        uint32 expectedContributors = GetExpectedContributorCount(group, victim, player);
 
         if (_logging)
         {
-            LOG_INFO("XPCatchup", "[XP Catch-Up] First player {} for victim {} (GUID: {}): {} XP (added to pool)",
-                player->GetName(), victim->GetEntry(), victim->GetGUID().ToString(), amount);
+            LOG_INFO("XPCatchup", "[XP Catch-Up] Pool start: mob={} first={} xp={} expect={}",
+                victim->GetEntry(), player->GetName(), amount, expectedContributors);
         }
 
         // Zero this player's amount so only the pool has this XP
         amount = 0;
-        return;
+
+        if (expectedContributors > 1)
+            return;
+
+        it = _pendingXP.find(victim->GetGUID());
+    }
+    else
+    {
+        // Not first player — add their XP to the redistribution pool and zero their share
+        it->second.total += amount;
+        it->second.count++;
+        it->second.timestamp = time(NULL);  // Reset timestamp on each contribution
+
+        // Only add contributor if not already in the list (defensive check)
+        bool alreadyContributed = false;
+        for (const auto& guid : it->second.contributors)
+        {
+            if (guid == player->GetGUID())
+            {
+                alreadyContributed = true;
+                break;
+            }
+        }
+        if (!alreadyContributed)
+            it->second.contributors.push_back(player->GetGUID());
+
+        amount = 0;
     }
 
-    // Not first player — add their XP to the redistribution pool and zero their share
-    it->second.total += amount;
-    it->second.count++;
-    amount = 0;
+    uint32 expectedContributors = GetExpectedContributorCount(group, victim, player);
 
-    if (_logging)
+    if (_logging && it->second.contributors.size() >= expectedContributors)
     {
-        LOG_INFO("XPCatchup", "[XP Catch-Up] Contribution from {} to victim {} (GUID: {}): pool now {} XP (count {})",
-            player->GetName(), victim->GetEntry(), victim->GetGUID().ToString(), it->second.total, it->second.count);
+        LOG_INFO("XPCatchup", "[XP Catch-Up] Pool ready: mob={} xp={} contrib={}/{}",
+            victim->GetEntry(), it->second.total, it->second.contributors.size(), expectedContributors);
     }
 
-    // Redistribute pool when all members have contributed
-    if (it->second.count >= group->GetMembersCount())
+    // Redistribute pool when all expected XP callbacks for this victim have arrived.
+    // Using GetMembersCount() breaks when some group members are offline/out of range.
+    if (expectedContributors > 0 && it->second.contributors.size() >= expectedContributors)
     {
-        Player* master = FindMaster(group);
-        if (!master)
+        Player* reference = FindReferencePlayer(group, victim, player);
+        if (!reference)
         {
             if (_logging)
             {
-                LOG_INFO("XPCatchup", "[XP Catch-Up] No valid master found for victim {}. Pool discarded ({})",
+                LOG_INFO("XPCatchup", "[XP Catch-Up] No reference player found for victim {}. Pool discarded ({})",
                     victim->GetEntry(), it->second.total);
             }
             _pendingXP.erase(it);
@@ -393,58 +532,37 @@ void XPCatchupPlayerScript::OnPlayerGiveXP(Player* player, uint32& amount, Unit*
 
         if (_logging)
         {
-            LOG_INFO("XPCatchup", "[XP Catch-Up] Master {} (level {}) found. Redistributing {} XP from {} contributors",
-                master->GetName(), master->GetLevel(), it->second.total, it->second.count);
+            LOG_INFO("XPCatchup", "[XP Catch-Up] Redistribute: ref={} lvl={} xp={} contrib={}",
+                reference->GetName(), reference->GetLevel(), it->second.total, it->second.contributors.size());
         }
 
         if (_distribution == 1)
         {
-            // Dynamic mode: split pool proportionally by XP deficit
-            auto targets = FindDynamicTargets(group, master);
-            if (_logging)
-            {
-                LOG_INFO("XPCatchup", "[XP Catch-Up] Dynamic mode: {} eligible targets found", targets.size());
-            }
-            DistributeXP(it->second.total, targets, player, master, group);
+            auto targets = FindDynamicTargets(group, reference, victim, player);
+            DistributeXP(it->second.total, targets, victim, reference, group);
         }
         else
         {
-            // Lowest mode (default): give all to single lowest-XP member
-            Player* target = FindLowestXPMember(group, ObjectGuid::Empty);
-            // If no eligible bot found (all bots ahead of master in level),
-            // give XP to the master so they don't lose progress
-            if (!target)
-            {
-                target = master;
-            }
-
+            Player* target = FindLowestXPMember(group, reference, victim, player, ObjectGuid::Empty);
             if (target)
             {
                 if (_logging)
                 {
-                    LOG_INFO("XPCatchup", "[XP Catch-Up] Lowest mode: giving {} XP to {} (ratio {:.4f}) -> master ratio {:.4f}",
-                        it->second.total, target->GetName(),
-                        (float)target->GetUInt32Value(PLAYER_XP) / std::max(1u, target->GetUInt32Value(PLAYER_NEXT_LEVEL_XP)),
-                        (float)master->GetUInt32Value(PLAYER_XP) / std::max(1u, master->GetUInt32Value(PLAYER_NEXT_LEVEL_XP)));
+                    LOG_INFO("XPCatchup", "[XP Catch-Up] Lowest mode: giving {} XP to {} (ratio {:.4f}) -> reference {} ratio {:.4f}",
+                        it->second.total, target->GetName(), GetProgressRatio(target), reference->GetName(), GetProgressRatio(reference));
                 }
 
-                // Save XP progress ratios before giving XP (state before this kill)
-                uint32 targetXPBefore = target->GetUInt32Value(PLAYER_XP);
-                uint32 targetNextLevelXP = target->GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
-                float targetRatio = (targetNextLevelXP > 0) ? (float)targetXPBefore / targetNextLevelXP : 0.0f;
-                uint32 masterXPBefore = master->GetUInt32Value(PLAYER_XP);
-                uint32 masterNextLevelXP = master->GetUInt32Value(PLAYER_NEXT_LEVEL_XP);
-                float masterRatio = (masterNextLevelXP > 0) ? (float)masterXPBefore / masterNextLevelXP : 0.0f;
-                uint32 masterLevel = master->GetLevel();
+                float targetRatio = GetProgressRatio(target);
+                float referenceRatio = GetProgressRatio(reference);
+                uint32 referenceLevel = reference->GetLevel();
 
-                target->GiveXP(it->second.total, player, 1.0f);
+                target->GiveXP(it->second.total, victim, 1.0f);
 
-                // Debug: log distribution to party chat
                 if (_chatdebug)
                 {
-                    uint32 levelDeficit = masterLevel - target->GetLevel();
+                    uint32 levelDeficit = referenceLevel - target->GetLevel();
                     int32 totalDeficit = static_cast<int32>(levelDeficit * 10000.0f)
-                                       + static_cast<int32>((masterRatio - targetRatio) * 10000.0f);
+                                       + static_cast<int32>((referenceRatio - targetRatio) * 10000.0f);
                     int32 deficit = std::max(0, totalDeficit);
                     float deficitPct = deficit / 100.0f;
                     uint32 weight = deficit > 0 ? static_cast<uint32>(deficit) : 1;
@@ -463,13 +581,10 @@ void XPCatchupPlayerScript::OnPlayerGiveXP(Player* player, uint32& amount, Unit*
                     }
                 }
             }
-            else
+            else if (_logging)
             {
-                if (_logging)
-                {
-                    LOG_INFO("XPCatchup", "[XP Catch-Up] Lowest mode: no eligible target found for victim {}. Pool discarded ({})",
-                        victim->GetEntry(), it->second.total);
-                }
+                LOG_INFO("XPCatchup", "[XP Catch-Up] Lowest mode: no eligible target found for victim {}. Pool discarded ({})",
+                    victim->GetEntry(), it->second.total);
             }
         }
 
@@ -495,12 +610,12 @@ void XPCatchupWorldScript::OnAfterConfigLoad(bool reload)
 
     if (reload)
     {
-        LOG_INFO("XPCatchup", "Configuration reloaded. Enable={}, LevelWindow={}, Distribution={}, RequireRealMaster={}, ChatDebug={}, Logging={}",
+        LOG_INFO("XPCatchup", "Configuration reloaded. Enable={}, LevelWindow={}, Distribution={}, RequireRealMaster={} (deprecated/ignored), ChatDebug={}, Logging={}",
             _enabled, _levelWindow, _distribution, _requireRealMaster, _chatdebug, _logging);
     }
     else
     {
-        //LOG_INFO("XPCatchup", "XP Catch-Up loaded. Enable={}, LevelWindow={}, Distribution={}, RequireRealMaster={}, ChatDebug={}, Logging={}",
+        //LOG_INFO("XPCatchup", "XP Catch-Up loaded. Enable={}, LevelWindow={}, Distribution={}, RequireRealMaster={} (deprecated/ignored), ChatDebug={}, Logging={}",
         //    _enabled, _levelWindow, _distribution, _requireRealMaster, _chatdebug, _logging);
     }
 }
@@ -523,7 +638,7 @@ void XPCatchupWorldScript::OnBeforeWorldInitialized()
     LOG_INFO("server.loading", "╚══════════════════════════════════════════════════════════╝");
 
     LOG_INFO("XPCatchup", "XP Catch-Up Config loaded with options:");
-    LOG_INFO("XPCatchup", "Enable={}, LevelWindow={}, Distribution={}, RequireRealMaster={}, ChatDebug={}, Logging={}",
+    LOG_INFO("XPCatchup", "Enable={}, LevelWindow={}, Distribution={}, RequireRealMaster={} (deprecated/ignored), ChatDebug={}, Logging={}",
         _enabled, _levelWindow, _distribution, _requireRealMaster, _chatdebug, _logging);
 }
 
@@ -538,10 +653,11 @@ void XPCatchupWorldScript::OnUpdate(uint32 diff)
 
     time_t now = time(NULL);
 
-    // Clean up expired pending XP entries (older than 2 seconds)
+    // Clean up expired pending XP entries (older than 10 seconds)
+    // The timestamp is reset on each contribution, so this only removes truly stale pools
     for (auto it = _pendingXP.begin(); it != _pendingXP.end(); )
     {
-        if (difftime(now, it->second.timestamp) > 2)
+        if (difftime(now, it->second.timestamp) > 10)
             it = _pendingXP.erase(it);
         else
             ++it;

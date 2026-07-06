@@ -2,24 +2,24 @@
 
 A dynamic XP redistribution module for **AzerothCore** (WotLK 3.3.5a).
 
-When a group of characters kill creatures together, this module redistributes the accumulated kill XP so that lower-level characters catch up to the highest-level member of the group — keeping everyone on a similar progression track.
+When a group of characters kill creatures together, this module redistributes the accumulated kill XP so that lower-level characters catch up to the current highest-level eligible member of the group for that kill — keeping everyone on a similar progression track.
 
-> **Note:** Works with both the mod-playerbots fork and vanilla AzerothCore. When not using mod-playerbots, the `RequireRealMaster` config option is a no-op (all players are treated as real).
+> **Note:** Works with both the mod-playerbots fork and vanilla AzerothCore. `RequireRealMaster` is now a deprecated compatibility option and is ignored; catchup works for players and bots alike.
 
 ---
 
 ## Features
 
-- **XP Equalization** — Collects kill XP from all party members into a shared pool and redistributes it based on each member's progress relative to the master
+- **XP Equalization** — Collects kill XP from all eligible party or raid members into a shared pool and redistributes it based on each member's progress relative to the current highest-level eligible character for that kill
 - **Two Distribution Modes:**
   - **Lowest** (default) — gives the entire XP pool to the single character furthest behind
   - **Dynamic** — splits the pool proportionally, weighted by how far behind each character is
-- **Configurable Level Window** — only characters within N levels of the master participate (default: 7 levels)
-- **Real Player Master** — the party leader must be a real player; bot leaders are skipped (only effective when mod-playerbots is installed; on vanilla AzerothCore all party leaders are treated as real players)
+- **Configurable Level Window** — only characters within N levels of the current highest-level eligible character participate (default: 7 levels)
+- **Players and Bots** — catchup works for players and bots alike; the old `RequireRealMaster` option is retained only for backward-compatible config files
 - **Kill XP Only** — quest XP, reputation XP, and other sources are left untouched
 - **Configurable & Debuggable** — toggle features, set a catchup activation threshold, and enable debug logging to watch the redistribution in real time
 - **Catchup Threshold** — skip redistribution when all members are within a configurable margin of each other, letting natural XP flow
-- **Master XP** — the master receives XP from the pool when they have fallen behind, so the module works in both directions
+- **Reference-Aware Catchup** — if the current highest-level eligible character later falls behind another equally high-level character’s progress, the new highest-progress character naturally becomes the reference on subsequent kills
 
 ---
 
@@ -30,29 +30,29 @@ When a group of characters kill creatures together, this module redistributes th
 1. Party members kill a creature. All XP from that kill is collected into a redistribution pool — no XP is lost, it all flows through the pool.
 2. The pool accumulates XP from every group member for that victim (tracked by victim GUID).
 3. When all members have contributed, the pool is redistributed — either all to the lowest-XP member (lowest mode), or split proportionally by XP deficit (dynamic mode).
-4. If no member has at least 10 percent XP deficit relative to the master, the catchup is skipped entirely and all XP flows naturally.
-5. Members above the master's level are excluded from receiving redistribution. The master receives XP when they have the lowest progress ratio.
+4. The highest-level eligible character for that kill becomes the reference point. If no eligible member is at least 10 percent behind that reference, catchup is skipped entirely and all XP flows naturally.
+5. Members outside the configured level window from that reference are excluded from redistribution.
 
 ### Example
 
 ```
-Party leader (Audin, level 8):    10,000 / 12,000 XP  (83.3% progress — master)
-Ally (level 8):                   5,000 / 12,000 XP   (41.7% progress)
-Bob (level 8):                    3,000 / 12,000 XP   (25.0% progress)
-Bard (level 8):                   7,000 / 12,000 XP   (58.3% progress)
-Dave (level 8):                   9,000 / 12,000 XP   (75.0% progress)
+Highest eligible player (Audin, level 8): 10,000 / 12,000 XP  (83.3% progress — reference)
+Ally (level 8):                    5,000 / 12,000 XP   (41.7% progress)
+Bob (level 8):                     3,000 / 12,000 XP   (25.0% progress)
+Bard (level 8):                    7,000 / 12,000 XP   (58.3% progress)
+Dave (level 8):                    9,000 / 12,000 XP   (75.0% progress)
 ```
 
 In **lowest mode**, Bob gets the entire redistributed pool (lowest progress ratio).
 
-In **dynamic mode**, weights combine level deficit (100% per level) plus XP progress ratio deficit relative to the master. Members above the master's level are excluded:
+In **dynamic mode**, weights combine level deficit (100% per level) plus XP progress ratio deficit relative to the current highest-level eligible reference player:
 - Ally (0 levels, ratio deficit 41.7%) → weight 4167 → ~31% of pool
 - Bob (0 levels, ratio deficit 58.3%) → weight 5833 → ~44% of pool
 - Bard (0 levels, ratio deficit 25.0%) → weight 2500 → ~19% of pool
 - Dave (0 levels, ratio deficit 8.3%) → weight 833 → ~6% of pool
 
-If a character is 2 levels below the master, they get a 200% base deficit on top of their ratio deficit:
-- Newbie (level 6, 30% progress) vs master (83.3%) → weight = 20000 + 5330 = 25330
+If a character is 2 levels below the reference player, they get a 200% base deficit on top of their ratio deficit:
+- Newbie (level 6, 30% progress) vs reference (83.3%) → weight = 20000 + 5330 = 25330
 
 ---
 
@@ -105,16 +105,17 @@ Edit `<ACoreDir>/env/dist/etc/modules/xpcatchup.conf` in your server's config di
 # Main toggle - enables or disables the XP catch-up system
 XPCatchup.Enable = true
 
-# Level difference window - members more than this far from the master's
-# level are excluded from XP redistribution
+# Level difference window - members more than this far from the current
+# highest-level eligible character for the kill are excluded from XP redistribution
 # Recommended: 7 (matches the effective party XP sharing range in WotLK)
 # Higher values allow catch-up for wider level spreads but may include
 # members who receive negligible XP from kills.
 XPCatchup.LevelWindow = 7
 
-# If the party leader is a bot, skip catch-up entirely.
-# Only effective when mod-playerbots is installed; otherwise this option is a no-op.
-# Set to false to allow catch-up even when the master is a bot
+# Deprecated compatibility option.
+# Catchup now works for players and bots alike and uses the highest-level
+# eligible character for each kill as the reference point, not the party leader.
+# This setting is currently ignored and kept only for backward compatibility.
 XPCatchup.RequireRealMaster = true
 
 # Distribution algorithm:
@@ -124,7 +125,7 @@ XPCatchup.Distribution = 0
 
 # Catchup activation threshold (percent)
 # Catchup only activates when at least one group member has a deficit >=
-# this percentage relative to the master.
+# this percentage relative to the current highest-level eligible character.
 XPCatchup.Threshold = 10
 
 # Chat debug mode - sends what each bot received to party chat after each kill
@@ -156,10 +157,10 @@ Restart your worldserver to load the module:
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `XPCatchup.Enable` | Boolean | `true` | Enable or disable the XP catch-up system globally |
-| `XPCatchup.LevelWindow` | Integer | `7` | Maximum level difference from master for eligible members. Recommended: 7 (matches WotLK party XP sharing range) |
-| `XPCatchup.RequireRealMaster` | Boolean | `true` | Party leader must be a real player; bot leaders are ignored. Only effective when mod-playerbots is installed; otherwise this option is a no-op. |
+| `XPCatchup.LevelWindow` | Integer | `7` | Maximum level difference from the current highest-level eligible character for eligible members. Recommended: 7 (matches WotLK party XP sharing range) |
+| `XPCatchup.RequireRealMaster` | Boolean | `true` | Deprecated compatibility option. Ignored by current logic; catchup works for players and bots alike. |
 | `XPCatchup.Distribution` | Integer | `0` | `0` = lowest, `1` = dynamic weighted distribution |
-| `XPCatchup.Threshold` | Integer | `10` | Catchup activates only when at least one member has a deficit >= this percentage relative to the master. Set to 0 to always activate. |
+| `XPCatchup.Threshold` | Integer | `10` | Catchup activates only when at least one eligible member has a deficit >= this percentage relative to the current highest-level eligible character. Set to 0 to always activate. |
 | `XPCatchup.ChatDebug` | Boolean | `false` | Send redistribution details to party chat after each kill |
 | `XPCatchup.Logging` | Boolean | `false` | Enable detailed LOG_INFO output to console and Server.log |
 
@@ -173,35 +174,34 @@ The module hooks into AzerothCore's `PlayerScript::OnPlayerGiveXP` callback, whi
 
 ### Accumulation & Redistribution
 
-1. **Threshold check** — when `OnPlayerGiveXP` fires, the module first checks whether any group member has a deficit >= `Threshold` percent relative to the master. If not, the hook returns immediately and all XP flows naturally.
+1. **Threshold check** — when `OnPlayerGiveXP` fires, the module first finds the current highest-level eligible character for that kill and checks whether any eligible group member has a deficit >= `Threshold` percent relative to that reference. If not, the hook returns immediately and all XP flows naturally.
 2. **For each player who kills** — the core calculates their XP share, then `OnPlayerGiveXP` fires. The module intercepts it and adds it to a pending pool (tracked by victim GUID). The player's XP is zeroed at this point.
-3. **Pool accumulation** — the module waits for every group member to contribute. The pool contains the sum of all players' XP for that specific kill.
-4. **Redistribution** — once all members have contributed, the pool is redistributed according to the selected algorithm. No XP is lost; it flows through the pool and out to the recipients. The master may also be a recipient if they have the lowest progress ratio.
+3. **Pool accumulation** — the module waits for every AzerothCore-eligible XP recipient for that kill to contribute. The pool contains the sum of all those players' XP for that specific kill.
+4. **Redistribution** — once all eligible contributors have contributed, the pool is redistributed according to the selected algorithm. No XP is lost; it flows through the pool and out to the recipients.
 5. In **lowest mode**, the entire pool goes to the single lowest-XP member. In **dynamic mode**, it is split proportionally by XP progress ratio deficit weighted by level difference.
 
 ### Eligibility Rules
 
 - Only `XPSOURCE_KILL` XP is intercepted (quest XP, reputation, etc. pass through)
-- The party leader must be a real player (configurable via `RequireRealMaster`; no-op when mod-playerbots is not installed)
-- Members more than `LevelWindow` levels from the master are excluded
-- Members above the master's level get zero from redistribution
-- If no member has a deficit >= `Threshold` percent relative to the master, catchup is skipped entirely
-- The master can also receive XP when they have the lowest progress ratio
+- Only players AzerothCore would reward for that kill are pooled and considered for redistribution
+- Members more than `LevelWindow` levels from the current highest-level eligible character are excluded
+- If no eligible member has a deficit >= `Threshold` percent relative to the current highest-level eligible character, catchup is skipped entirely
+- Players and bots are both supported; `RequireRealMaster` is deprecated and ignored
 - Dead members are naturally excluded (core doesn't call `OnPlayerGiveXP` for them)
 
 ### Cleanup
 
-A world script runs every 5 seconds to clean up expired pending XP entries (older than 2 seconds), preventing memory leaks from stale state.
+A world script runs every 5 seconds to clean up expired pending XP entries (older than 10 seconds since the last contribution), preventing stale pools from lingering forever while still allowing large groups enough time to finish a kill’s XP callback fan-out.
 
 ---
 
 ## Edge Cases & Limitations
 
-- **Bot Party Leaders** — If `RequireRealMaster = true` and the party leader is a bot, no redistribution occurs. Set to `false` to allow bot-master parties (uses lowest-XP member as target). Only effective when mod-playerbots is installed.
+- **Deprecated Master Setting** — `RequireRealMaster` is retained only for backward-compatible config files and is ignored by the current logic.
 - **Level 80 Players** — Level 80 players receive zero XP from the core. The module sees already-zero XP and has no effect.
 - **Rest XP** — Rest XP bonuses apply to redistributed XP automatically (interception happens before `GiveXP()` is called).
 - **Pets** — Pet XP (`GivePetXP`) is not intercepted; bots control their own pets.
-- **Party Leader Changes** — The new leader becomes the master for subsequent kills. No special handling needed.
+- **Reference Changes** — The highest-level eligible character for each kill becomes the reference for that kill. No persistent leader tracking is required.
 
 ---
 
@@ -222,7 +222,7 @@ Enable chat debug mode by setting `XPCatchup.ChatDebug = true`. After each kill,
 These appear in **party chat** as if the bot sent them. All group members will see each message.
 
 - **weight** — proportional weight for XP distribution (higher = further behind). Combines level deficit (100% per level) plus XP progress ratio deficit.
-- **deficit** — XP progress ratio deficit relative to the master (percentage), before this kill. A higher percentage means further behind the master's progress.
+- **deficit** — XP progress ratio deficit relative to the current highest-level eligible reference character (percentage), before this kill. A higher percentage means further behind that reference player's progress.
 
 ### Debug Logging
 
