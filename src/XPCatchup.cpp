@@ -15,6 +15,7 @@
  * with this program. If not, see <http://www.gnu.org/licenses/>
  */
 
+#include "RandomPlayerbotMgr.h"
 #include "XPCatchup.h"
 #include "Chat.h"
 #include "Group.h"
@@ -50,9 +51,21 @@ static bool IsWithinLevelWindow(Player* member, Player* reference)
     return levelDiff <= static_cast<int8>(_levelWindow);
 }
 
+static bool IsExcludedPlayer(Player* player)
+{
+    if (!player)
+        return true;
+
+     return sRandomPlayerbotMgr.IsRandomBot(player);
+}
+
 static bool IsExpectedContributor(Player* member, Unit* victim, Player* currentPlayer)
 {
     if (!member || !victim)
+        return false;
+
+    // Random bots are completely ignored by XP Catch-Up.
+    if (IsExcludedPlayer(member))
         return false;
 
     return member == currentPlayer || member->IsAtGroupRewardDistance(victim);
@@ -427,6 +440,10 @@ static void DistributeXP(uint32 pool, std::vector<TargetShare>& targets, Unit* v
 // Main hook: OnPlayerGiveXP
 void XPCatchupPlayerScript::OnPlayerGiveXP(Player* player, uint32& amount, Unit* victim, uint8 xpSource)
 {
+    // Random bots are completely ignored by XP Catch-Up.
+    if (IsExcludedPlayer(player))
+        return;
+
     // Only intercept kill XP
     if (xpSource != XPSOURCE_KILL)
         return;
