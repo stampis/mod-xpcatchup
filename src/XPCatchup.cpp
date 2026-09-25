@@ -24,6 +24,7 @@
 #include "ObjectAccessor.h"
 #include "ScriptMgr.h"
 #include "World.h"
+#include "IndividualProgression.h"
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
@@ -59,6 +60,34 @@ static bool IsExcludedPlayer(Player* player)
      return sRandomPlayerbotMgr.IsRandomBot(player);
 }
 
+// Mirrors the zero-out logic in IndividualPlayerProgression::OnPlayerGiveXP without
+// actually mutating any XP amount. Returns false for a member that sIndividualProgression
+// would give zero XP to (insufficient progression for their current level), so such a
+// member is never used to feed or draw from the XP Catch-Up pool.
+static bool PassesIndividualProgressionXPCheck(Player* member)
+{
+    if (!sIndividualProgression->enabled)
+        return true;
+
+    if (!member || !member->IsInWorld())
+        return true;
+
+    if (sIndividualProgression->isExcludedAccount(member))
+        return true;
+
+    if (sIndividualProgression->isBotAccount(member))
+        return member->GetLevel() < sIndividualProgression->BotAccountsMaxLevel;
+
+    // Normal account: same level/progression gates as IndividualProgression's own hook.
+    if (!sIndividualProgression->hasPassedProgression(member, PROGRESSION_PRE_TBC) && member->GetLevel() >= 60)
+        return false;
+
+    if (!sIndividualProgression->hasPassedProgression(member, PROGRESSION_TBC_TIER_5) && member->GetLevel() >= 70)
+        return false;
+
+    return true;
+}
+
 static bool IsExpectedContributor(Player* member, Unit* victim, Player* currentPlayer)
 {
     if (!member || !victim)
@@ -66,6 +95,11 @@ static bool IsExpectedContributor(Player* member, Unit* victim, Player* currentP
 
     // Random bots are completely ignored by XP Catch-Up.
     if (IsExcludedPlayer(member))
+        return false;
+
+    // A member sIndividualProgression would zero XP for should neither contribute to
+    // nor receive a share of the redistribution pool.
+    if (!PassesIndividualProgressionXPCheck(member))
         return false;
 
     return member == currentPlayer || member->IsAtGroupRewardDistance(victim);
